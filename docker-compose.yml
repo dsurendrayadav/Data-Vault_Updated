@@ -1,0 +1,183 @@
+version: "3.9"
+
+# ============================================================================
+# DataVault — multi-database operations dashboard
+# 3-node PostgreSQL replication cluster (1 primary + 2 replicas)
+# 3-shard MongoDB cluster (1 config server + 3 shards + 1 mongos router)
+# Python/Streamlit dashboard on top of both
+# ============================================================================
+
+services:
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL cluster: primary + 2 streaming-replication replicas
+  # -------------------------------------------------------------------------
+  pg-primary:
+    build: ./postgres/primary
+    container_name: dv-pg-primary
+    hostname: pg-primary
+    environment:
+      POSTGRES_PASSWORD: datavault
+      POSTGRES_USER: datavault
+      POSTGRES_DB: datavault
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator_pw
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_primary_data:/var/lib/postgresql/data
+      - pg_wal_archive:/var/lib/postgresql/wal_archive
+    networks:
+      - datavault-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U datavault"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pg-replica1:
+    build: ./postgres/replica
+    container_name: dv-pg-replica1
+    hostname: pg-replica1
+    environment:
+      PRIMARY_HOST: pg-primary
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator_pw
+      NODE_NAME: replica1
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_replica1_data:/var/lib/postgresql/data
+    networks:
+      - datavault-net
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+
+  pg-replica2:
+    build: ./postgres/replica
+    container_name: dv-pg-replica2
+    hostname: pg-replica2
+    environment:
+      PRIMARY_HOST: pg-primary
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator_pw
+      NODE_NAME: replica2
+    ports:
+      - "5434:5432"
+    volumes:
+      - pg_replica2_data:/var/lib/postgresql/data
+    networks:
+      - datavault-net
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # MongoDB cluster: config server + 3 shards + mongos router
+  # (each shard is a single-node replica set to keep the demo lightweight;
+  #  see README for how to scale each shard to a 3-node replica set)
+  # -------------------------------------------------------------------------
+  mongo-configsvr:
+    image: mongo:7.0
+    container_name: dv-mongo-configsvr
+    hostname: mongo-configsvr
+    command: ["mongod", "--configsvr", "--replSet", "configReplSet", "--port", "27019", "--bind_ip_all"]
+    volumes:
+      - mongo_config_data:/data/db
+    networks:
+      - datavault-net
+
+  mongo-shard1:
+    image: mongo:7.0
+    container_name: dv-mongo-shard1
+    hostname: mongo-shard1
+    command: ["mongod", "--shardsvr", "--replSet", "shard1RS", "--port", "27018", "--bind_ip_all"]
+    volumes:
+      - mongo_shard1_data:/data/db
+    networks:
+      - datavault-net
+
+  mongo-shard2:
+    image: mongo:7.0
+    container_name: dv-mongo-shard2
+    hostname: mongo-shard2
+    command: ["mongod", "--shardsvr", "--replSet", "shard2RS", "--port", "27018", "--bind_ip_all"]
+    volumes:
+      - mongo_shard2_data:/data/db
+    networks:
+      - datavault-net
+
+  mongo-shard3:
+    image: mongo:7.0
+    container_name: dv-mongo-shard3
+    hostname: mongo-shard3
+    command: ["mongod", "--shardsvr", "--replSet", "shard3RS", "--port", "27018", "--bind_ip_all"]
+    volumes:
+      - mongo_shard3_data:/data/db
+    networks:
+      - datavault-net
+
+  mongo-router:
+    image: mongo:7.0
+    container_name: dv-mongo-router
+    hostname: mongo-router
+    command: ["mongos", "--configdb", "configReplSet/mongo-configsvr:27019", "--port", "27017", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    networks:
+      - datavault-net
+    depends_on:
+      - mongo-configsvr
+      - mongo-shard1
+      - mongo-shard2
+      - mongo-shard3
+
+  mongo-setup:
+    image: mongo:7.0
+    container_name: dv-mongo-setup
+    entrypoint: ["bash", "/scripts/init-cluster.sh"]
+    volumes:
+      - ./mongo:/scripts
+    networks:
+      - datavault-net
+    depends_on:
+      - mongo-router
+
+  # -------------------------------------------------------------------------
+  # Dashboard
+  # -------------------------------------------------------------------------
+  dashboard:
+    build: ./dashboard
+    container_name: dv-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      PG_PRIMARY_HOST: pg-primary
+      PG_PRIMARY_PORT: 5432
+      PG_REPLICA_HOSTS: "pg-replica1:5432,pg-replica2:5432"
+      PG_USER: datavault
+      PG_PASSWORD: datavault
+      PG_DATABASE: datavault
+      MONGO_URI: "mongodb://mongo-router:27017"
+    volumes:
+      - ./runbook:/app/runbook:ro
+    networks:
+      - datavault-net
+    depends_on:
+      - pg-primary
+      - mongo-router
+
+networks:
+  datavault-net:
+    driver: bridge
+
+volumes:
+  pg_primary_data:
+  pg_replica1_data:
+  pg_replica2_data:
+  pg_wal_archive:
+  mongo_config_data:
+  mongo_shard1_data:
+  mongo_shard2_data:
+  mongo_shard3_data:
